@@ -16,6 +16,82 @@ import pytesseract
 import spacy
 import shutil
 import platform
+from supabase import create_client, Client
+import pdfkit
+from datetime import datetime
+import uuid
+import zipfile
+import shutil
+import time
+from flask import Flask, request, jsonify, make_response, send_file
+from werkzeug.utils import secure_filename
+
+# Create temporary directory for file storage
+UPLOAD_FOLDER = os.path.join(tempfile.gettempdir(), 'resume_uploads')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+def cleanup_old_files():
+    """Remove files older than 1 hour from the upload folder"""
+    try:
+        current_time = time.time()
+        for filename in os.listdir(UPLOAD_FOLDER):
+            file_path = os.path.join(UPLOAD_FOLDER, filename)
+            # If file is older than 1 hour, delete it
+            if os.path.exists(file_path) and os.path.getmtime(file_path) < (current_time - 3600):
+                os.remove(file_path)
+    except Exception as e:
+        print(f"Error cleaning up old files: {e}")
+
+def save_uploaded_file(file):
+    """
+    Save the uploaded file to a temporary directory and return the saved file path
+    """
+    try:
+        print(f"Starting file save process for {file.filename}")
+        
+        # Ensure upload folder exists
+        if not os.path.exists(UPLOAD_FOLDER):
+            print(f"Creating upload folder: {UPLOAD_FOLDER}")
+            os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        
+        # Generate a unique filename
+        original_filename = secure_filename(file.filename)
+        file_extension = os.path.splitext(original_filename)[1]
+        if not file_extension:  # If no extension, try to guess from content type
+            if 'pdf' in file.content_type:
+                file_extension = '.pdf'
+            elif 'image' in file.content_type:
+                file_extension = '.png' if 'png' in file.content_type else '.jpg'
+        
+        unique_filename = f"{str(uuid.uuid4())}{file_extension}"
+        file_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+        
+        print(f"Generated unique filename: {unique_filename}")
+        print(f"Full file path: {file_path}")
+        
+        # Save the file
+        file.save(file_path)
+        
+        # Verify file was saved
+        if os.path.exists(file_path):
+            print(f"File successfully saved at: {file_path}")
+            print(f"File size: {os.path.getsize(file_path)} bytes")
+            
+            result = {
+                'file_path': file_path,
+                'original_filename': original_filename,
+                'unique_filename': unique_filename
+            }
+            print("Returning file info:", result)
+            return result
+        else:
+            print("File was not saved successfully")
+            return None
+            
+    except Exception as e:
+        print(f"Error saving file: {str(e)}")
+        print("Full error details:", traceback.format_exc())
+        return None
 
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
@@ -30,6 +106,9 @@ from torch.utils.data import DataLoader, Dataset
 
 from transformers import DistilBertTokenizer, DistilBertForSequenceClassification
 
+import json
+import traceback
+
 # Load spaCy model
 nlp = spacy.load("en_core_web_sm", disable=['parser', 'ner'])
 # Load the dataset
@@ -38,6 +117,11 @@ data = pd.read_csv(r'Dataset\resume_dataset - gpt_dataset.csv')
 # Load environment variables
 load_dotenv()
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Configure Gemini AI
 genai.configure(api_key=GEMINI_API_KEY)
@@ -602,16 +686,53 @@ def predict_job_role(resume_text, sections, distilbert_model, lstm_model, tokeni
         print(f"Error during prediction: {e}")
         raise
 
+def fetch_recent_feedback():
+    """
+    Fetch the 5 most recent positive and negative feedback entries from Supabase.
+    Returns a tuple of (positive_feedback, negative_feedback)
+    """
+    try:
+        print("Starting feedback fetch...")
+        
+        # Fetch positive feedback (where feedback is 'Positive feedback')
+        positive = supabase.table('feedback')\
+            .select('*')\
+            .eq('feedback', 'Positive feedback')\
+            .order('created_at', desc=True)\
+            .limit(5)\
+            .execute()
+        
+        print("Positive feedback fetched successfully")
+        
+        # Fetch negative feedback (where feedback is not 'Positive feedback')
+        negative = supabase.table('feedback')\
+            .select('*')\
+            .neq('feedback', 'Positive feedback')\
+            .order('created_at', desc=True)\
+            .limit(5)\
+            .execute()
+        
+        print("Negative feedback fetched successfully")
+        print(f"Found {len(positive.data)} positive and {len(negative.data)} negative feedback entries")
+        
+        return positive.data, negative.data
+        
+    except Exception as e:
+        print(f"Error fetching feedback: {str(e)}")
+        print("Full error details:", traceback.format_exc())
+        return [], []
+
 def enhance_prediction_with_gemini(job_role, confidence, resume_text, sections, explanation):
     """
     Enhance the prediction results using Gemini AI to provide a concise, HR-friendly analysis.
+    Now includes user feedback summary to improve contextual analysis.
     """
     print("\n=== Enhancing Prediction with Gemini AI ===")
     try:
         print("\n=== Starting Alternative Careers Analysis ===")
         print("Current Role Prediction:", job_role)
         print("Confidence Score:", f"{confidence*100:.1f}%")
-        
+
         # Calculate remaining percentage for alternative roles
         remaining_percentage = (1 - confidence) * 100
         print(f"\nRemaining percentage for alternative roles: {remaining_percentage:.1f}%")
@@ -640,10 +761,10 @@ Only suggest roles that are genuinely suitable based on their background. Use pr
 
         print("\n=== Sending Alternative Careers Request to Gemini AI ===")
         print("Prompt length:", len(alternative_careers_prompt))
-        
+
         alt_careers_response = gemini_text_model.generate_content(alternative_careers_prompt)
         alternative_careers = alt_careers_response.text
-        
+
         print("\n=== Received Alternative Careers Response ===")
         print("Response length:", len(alternative_careers))
         print("\nAlternative Careers Suggestions:")
@@ -651,8 +772,46 @@ Only suggest roles that are genuinely suitable based on their background. Use pr
         print(alternative_careers)
         print("-" * 50)
 
+        # === NEW: Fetch and process feedback ===
+        print("\n=== Fetching User Feedback ===")
+        feedback_summary = ""
+        try:
+            positive_feedback, negative_feedback = fetch_recent_feedback()
+            feedback_summary += "Recent User Feedback Summary:\n"
+
+            if positive_feedback:
+                feedback_summary += "\nPositive Feedback:\n"
+                for fb in positive_feedback:
+                    try:
+                        result = json.loads(fb['result'])
+                        if result.get('label') == job_role:
+                            feedback_summary += f"- Successful prediction for {job_role}\n"
+                    except:
+                        continue
+
+            if negative_feedback:
+                feedback_summary += "\nAreas for Improvement:\n"
+                improvement_patterns = {
+                    "The result is bias and not accurate": 0,
+                    "The role doesn't fit with the resume": 0,
+                    "The output is hard to understand": 0
+                }
+
+                for fb in negative_feedback:
+                    if fb['feedback'] in improvement_patterns:
+                        improvement_patterns[fb['feedback']] += 1
+
+                for issue, count in improvement_patterns.items():
+                    if count > 0:
+                        feedback_summary += f"- {issue}: {count} occurrences\n"
+
+        except Exception as feedback_error:
+            feedback_summary += "Feedback could not be retrieved or parsed."
+
         # Main analysis prompt
-        prompt = f"""Analyze this resume for the role of {job_role} (predicted with {confidence*100:.1f}% confidence) and provide a brief analysis in the following format:
+        prompt = f"""{feedback_summary}
+
+Analyze this resume for the role of {job_role} (predicted with {confidence*100:.1f}% confidence) and provide a brief analysis in the following format:
 
 Resume Content:
 {resume_text}
@@ -667,26 +826,19 @@ Please provide your analysis in this exact format:
 Overall Match:
 [Write 2-3 sentences about why this candidate matches the role]
 
-Alternative Career Paths:
-Here are some alternative career paths that would be suitable based on your skills and experience:
-
-Product Manager
-Match: 14.1%
-Reasoning: The candidate has demonstrated strong product-oriented thinking by leading projects from "concept to launch," managing user feedback, and winning entrepreneurial competitions like "Smart Spark+". Their versatile technical background in web, mobile, and IoT provides the breadth of knowledge needed to effectively manage and communicate with diverse development teams. This experience shows a clear ability to turn an "idea into an impactful solution."
-
-UI/UX Designer
-Match: 8.0%
-Reasoning: The resume explicitly lists "UI/UX Design" as a key skill and details experience using Figma to develop interfaces for both mobile and web applications. This indicates a practical ability and interest in creating user-friendly products. Their background as a developer would allow them to create designs that are both aesthetically pleasing and technically feasible to implement.
-
-IoT Engineer
-Match: 8.0%
-Reasoning: The candidate successfully led an "automate rover robot project," showcasing specific expertise in IoT devices, Arduino, and C++ programming. This hands-on experience in hardware integration and project management is a strong foundation for a career in the Internet of Things. This role directly leverages a unique and standout project on their resume.
+Alternative Careers:
+[ Write a brief analysis of the alternative careers suggested by Gemini AI, including their match percentages and reasoning the total percentage including the current role shouldn't exceed 100% and make them in to one section and remove any symbols in the section such as *]
+The Alternative Careers section should include the following roles:
+Role 1 (Role name)
+Match: prediction%
+Reasoning: Why the candidate is a good fit for this role based on their skills and experience.
+and so on as long as you think the candidate is a good fit for the role.
 
 Skills:
 [Describe the candidate's relevant skills and how they align with the role]
 
 Experience:
-[Highlight the most relevant work experience and achievements and show the duration of the experience (Example: Frontend developer for 2 moths from Jan-Feb 2025)]
+[Highlight the most relevant work experience and achievements and show the duration of the experience (Example: Frontend developer for 2 months from Jan-Feb 2025)]
 
 Education:
 [Discuss the relevance of their educational background]
@@ -698,19 +850,19 @@ Keep each section concise and focused on what's most relevant for HR review. Use
 
         print("\n=== Sending Main Analysis Request to Gemini AI ===")
         print("Main prompt length:", len(prompt))
-        
+
         response = gemini_text_model.generate_content(prompt)
         enhanced_analysis = response.text
-        
+
         print("\n=== Received Main Analysis Response ===")
         print("Main analysis length:", len(enhanced_analysis))
         print("\nAnalysis Sections Found:")
         sections_found = [section.split(':')[0] for section in enhanced_analysis.split('\n\n') if ':' in section]
         print('\n'.join(f"- {section}" for section in sections_found))
-        
+
         print("\n=== Enhancement Process Complete ===")
         return enhanced_analysis
-        
+
     except Exception as e:
         print(f"\n=== ERROR in Gemini Enhancement ===")
         print(f"Error type: {type(e).__name__}")
@@ -719,6 +871,7 @@ Keep each section concise and focused on what's most relevant for HR review. Use
         import traceback
         print(traceback.format_exc())
         return None
+
 
 # Update the HTML/JavaScript part to handle the new format
 def format_analysis_text(text):
@@ -1060,7 +1213,75 @@ HTML_CONTENT = """
     </div>
 
     <script>
+        let currentPrediction = null;  // Store the current prediction result
         const form = document.getElementById('uploadForm');
+        
+        async function downloadPDF() {
+            if (!currentPrediction) {
+                alert('No prediction data available');
+                return;
+            }
+            
+            try {
+                const downloadButton = document.querySelector('button[onclick="downloadPDF()"]');
+                const originalText = downloadButton.innerHTML;
+                
+                // Show loading state
+                downloadButton.innerHTML = `
+                    <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    Generating PDF...
+                `;
+                downloadButton.disabled = true;
+                
+                console.log('Sending prediction data:', currentPrediction);
+                const response = await fetch('/download-pdf', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(currentPrediction)
+                });
+                
+                            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.error || 'Failed to generate PDF');
+            }
+            
+            // Get the blob from response
+            const blob = await response.blob();
+            
+            // Create and click download link
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'job_prediction_report.pdf';
+            document.body.appendChild(a);
+            a.click();
+            
+            // Clean up
+            setTimeout(() => {
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(a);
+            }, 100);
+                
+            } catch (error) {
+                console.error('Error downloading PDF:', error);
+                alert('Failed to generate PDF. Please try again.');
+            } finally {
+                // Restore button state
+                const downloadButton = document.querySelector('button[onclick="downloadPDF()"]');
+                downloadButton.innerHTML = `
+                    <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                    </svg>
+                    Download PDF
+                `;
+                downloadButton.disabled = false;
+            }
+        }
         const fileInput = document.getElementById('file-upload');
         const preview = document.getElementById('preview');
         const pdfCanvas = document.getElementById('pdfCanvas');
@@ -1192,57 +1413,137 @@ HTML_CONTENT = """
             }
             
             const sections = explanation.text.split('\\n\\n');
-            return `
-                <div class="space-y-6">
-                    ${sections.map(section => {
-                        if (!section.includes(':')) return '';
-                        const [title, ...contentParts] = section.split('\\n');
-                        const sectionTitle = title.split(':')[0].trim();
-                        const content = contentParts.join('\\n').trim();
-                        
-                        if (sectionTitle === 'Alternative Career Paths') {
-                            // Special formatting for alternative careers section
-                            const careers = content.split('\\n\\n').filter(Boolean);
-                            return `
-                                <div class="bg-white p-6 rounded-xl border border-gray-200">
-                                    <h4 class="text-xl font-semibold text-gray-900 mb-4">${sectionTitle}</h4>
-                                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                                        ${careers.map(career => {
-                                            const lines = career.split('\\n');
-                                            const roleName = lines[0].trim();
-                                            const matchLine = lines.find(l => l.startsWith('Match:'));
-                                            const reasoningLine = lines.find(l => l.startsWith('Reasoning:'));
-                                            
-                                            const matchPercent = matchLine ? matchLine.split(':')[1].trim() : '';
-                                            const reasoning = reasoningLine ? reasoningLine.split(':')[1].trim() : '';
-                                            
-                                            return roleName ? `
-                                                <div class="bg-gray-50 p-4 rounded-lg hover:shadow-md transition-shadow duration-200">
-                                                    <div class="flex justify-between items-center mb-2">
-                                                        <span class="font-semibold text-gray-900">${roleName}</span>
-                                                        <span class="text-sm text-indigo-600 font-medium">${matchPercent}</span>
-                                                    </div>
-                                                    <p class="text-gray-700 text-sm">${reasoning}</p>
-                                                </div>
-                                            ` : '';
-                                        }).join('')}
+            let alternativeCareerContent = '';
+            let otherSections = [];
+            
+            // Process sections and collect alternative career paths
+            sections.forEach(section => {
+                if (!section.includes(':')) return;
+                
+                const [title, ...contentParts] = section.split('\\n');
+                const sectionTitle = title.split(':')[0].trim();
+                const content = contentParts.join('\\n').trim();
+                
+                otherSections.push({ title: sectionTitle, content });
+            });
+            
+            let html = '<div class="space-y-6">';
+            
+            // Add other sections first
+            otherSections.forEach(({ title, content }) => {
+                html += `
+                    <div class="bg-white p-6 rounded-xl border border-gray-200">
+                        <h4 class="text-xl font-semibold text-gray-900 mb-3">${title}</h4>
+                        <div class="text-gray-700 leading-relaxed whitespace-pre-line">${content}</div>
+                    </div>
+                `;
+            });
+            
+            // Add consolidated Alternative Career Paths section
+            if (alternativeCareerContent) {
+                // Remove the leading header text
+                const cleanedContent = alternativeCareerContent.replace(
+                    /^Alternative Career Paths\s*Here are some alternative career paths that would be suitable based on your skills and experience:\s*/i,
+                    ''
+                );
+
+                const careers = cleanedContent.split('\\n\\n').filter(Boolean);
+
+                html += `
+                    <div class="bg-white p-6 rounded-xl border border-gray-200">
+                        <h4 class="text-xl font-semibold text-gray-900 mb-4">Alternative Career Paths</h4>
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                            ${careers.map(career => {
+                                const lines = career.split('\\n').filter(line => line.trim());
+                                if (lines.length === 0) return '';
+
+                                const roleName = lines[0].trim();
+                                const matchLine = lines.find(l => l.toLowerCase().startsWith('match:'));
+                                const reasoningLine = lines.find(l => l.toLowerCase().startsWith('reasoning:'));
+
+                                const matchPercent = matchLine ? matchLine.split(':')[1].trim() : '';
+                                const reasoning = reasoningLine ? reasoningLine.split(':')[1].trim() : '';
+
+                                return roleName ? `
+                                    <div class="bg-gradient-to-br from-gray-50 to-gray-100 p-4 rounded-lg hover:shadow-md transition-all duration-200 border border-gray-200 hover:border-indigo-300">
+                                        <div class="flex justify-between items-start mb-2">
+                                            <h5 class="font-semibold text-gray-900 text-sm leading-tight">${roleName}</h5>
+                                            ${matchPercent ? `<span class="text-xs text-indigo-600 font-medium bg-indigo-50 px-2 py-1 rounded-full ml-2 flex-shrink-0">${matchPercent}</span>` : ''}
+                                        </div>
+                                        ${reasoning ? `<p class="text-gray-700 text-xs leading-relaxed">${reasoning}</p>` : ''}
                                     </div>
-                                </div>
-                            `;
-                        }
-                        
-                        return `
-                            <div class="bg-white p-6 rounded-xl border border-gray-200">
-                                <h4 class="text-xl font-semibold text-gray-900 mb-3">${sectionTitle}</h4>
-                                <div class="text-gray-700 leading-relaxed whitespace-pre-line">${content}</div>
-                            </div>
-                        `;
-                    }).join('')}
-                </div>
-            `;
+                                ` : '';
+                            }).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            
+            html += '</div>';
+            return html;
         }
         
+        // Add these new functions for feedback handling
+        function toggleFeedbackOptions() {
+            const feedbackOptions = document.getElementById('feedbackOptions');
+            feedbackOptions.classList.toggle('hidden');
+        }
+
+        async function submitFeedback(value, reason) {
+            try {
+                const feedbackOptions = document.getElementById('feedbackOptions');
+                const feedbackSuccess = document.getElementById('feedbackSuccess');
+                const feedbackButtons = document.querySelectorAll('.feedback-btn');
+                
+                // Disable all feedback buttons
+                feedbackButtons.forEach(btn => btn.disabled = true);
+                
+                // Prepare the feedback data
+                const feedbackData = {
+                    result: JSON.stringify(currentPrediction),
+                    feedback: value === 'good' ? 'Positive feedback' : reason
+                };
+
+                // Send feedback to the server
+                const response = await fetch('/feedback', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(feedbackData)
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to submit feedback');
+                }
+
+                // Hide feedback options if they're visible
+                feedbackOptions.classList.add('hidden');
+                
+                // Show success message
+                feedbackSuccess.classList.remove('hidden');
+                
+                // Disable feedback buttons permanently
+                feedbackButtons.forEach(btn => {
+                    btn.style.opacity = '0.5';
+                    btn.style.cursor = 'default';
+                    btn.onclick = null;
+                });
+                
+            } catch (error) {
+                console.error('Error submitting feedback:', error);
+                alert('Failed to submit feedback. Please try again.');
+                
+                // Re-enable feedback buttons on error
+                const feedbackButtons = document.querySelectorAll('.feedback-btn');
+                feedbackButtons.forEach(btn => btn.disabled = false);
+            }
+        }
+
         function displayPredictions(pred) {
+            // Store the current prediction
+            currentPrediction = pred;
             predictions.innerHTML = `
                 <div class="result-card fade-in">
                     <div class="flex items-start justify-between mb-6">
@@ -1257,7 +1558,7 @@ HTML_CONTENT = """
 
                     <div class="mb-6">
                         <div class="flex justify-between items-center mb-2">
-                            <span class="text-sm font-medium text-gray-700">Confidence Level</span>
+                            <span class="text-sm font-medium text-gray-700">Match Percentage</span>
                             <span class="text-sm text-gray-600">${(pred.confidence * 100).toFixed(2)}%</span>
                         </div>
                         <div class="w-full bg-gray-200 rounded-full h-2">
@@ -1276,8 +1577,48 @@ HTML_CONTENT = """
                             </svg>
                             Model: ${pred.model}
                         </div>
-                        <div class="text-sm text-gray-500">
-                            Processed with AI
+                        <div class="flex items-center space-x-4">
+                            <button onclick="downloadPDF()" class="inline-flex items-center px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors">
+                                <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                                </svg>
+                                Download PDF
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Feedback Section -->
+                    <div class="mt-6 pt-4 border-t border-gray-200 text-center">
+                        <h4 class="text-lg font-semibold text-gray-900 mb-4">Was this prediction helpful?</h4>
+                        <div class="flex items-center justify-center space-x-4 mb-4">
+                            <button class="feedback-btn" data-value="good" onclick="submitFeedback('good', null)">
+                                <svg class="w-8 h-8 text-gray-400 hover:text-green-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 10h4.764a2 2 0 011.789 2.894l-3.5 7A2 2 0 0115.263 21h-4.017c-.163 0-.326-.02-.485-.06L7 20m7-10V5a2 2 0 00-2-2h-.095c-.5 0-.905.405-.905.905 0 .714-.211 1.412-.608 2.006L7 11v9m7-10h-2M7 20H5a2 2 0 01-2-2v-6a2 2 0 012-2h2.5"></path>
+                                </svg>
+                            </button>
+                            <button class="feedback-btn" data-value="bad" onclick="toggleFeedbackOptions()">
+                                <svg class="w-8 h-8 text-gray-400 hover:text-red-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14H5.236a2 2 0 01-1.789-2.894l3.5-7A2 2 0 018.736 3h4.018c.163 0 .326.02.485.06L17 4m-7 10v2a2 2 0 002 2h.095c.5 0 .905-.405.905-.905 0-.714.211-1.412.608-2.006L17 13V4m-7 10h2"></path>
+                                </svg>
+                            </button>
+                        </div>
+
+                        <!-- Feedback Options (Hidden by default) -->
+                        <div id="feedbackOptions" class="hidden space-y-3 bg-gray-50 p-4 rounded-lg">
+                            <button class="w-full text-center px-4 py-2 rounded bg-white hover:bg-gray-100 transition-colors text-gray-700" onclick="submitFeedback('bad', 'The result is bias and not accurate')">
+                                The result is bias and not accurate
+                            </button>
+                            <button class="w-full text-center px-4 py-2 rounded bg-white hover:bg-gray-100 transition-colors text-gray-700" onclick="submitFeedback('bad', 'The role doesn\'t fit with the resume')">
+                                The role doesn't fit with the resume
+                            </button>
+                            <button class="w-full text-center px-4 py-2 rounded bg-white hover:bg-gray-100 transition-colors text-gray-700" onclick="submitFeedback('bad', 'The output is hard to understand')">
+                                The output is hard to understand
+                            </button>
+                        </div>
+
+                        <!-- Feedback Success Message -->
+                        <div id="feedbackSuccess" class="hidden mt-4 p-4 bg-green-50 text-green-700 rounded-lg text-center">
+                            Thank you for your feedback!
                         </div>
                     </div>
                 </div>
@@ -1307,15 +1648,21 @@ def predict():
         print("No file selected.")
         return jsonify({"error": "No file selected"}), 400
 
-    # Sanitize file name
-    safe_filename = re.sub(r'[^a-zA-Z0-9._-]', '_', file.filename)
-    temp_dir = tempfile.gettempdir()
-    file_path = os.path.join(temp_dir, safe_filename)
-    print(f"Attempting to save file to: {file_path}")
+    print("Received file:", file.filename)
+    print("File content type:", file.content_type)
+    
+    # Save the uploaded file
+    file_info = save_uploaded_file(file)
+    print("File info after save:", file_info)
+    
+    if not file_info:
+        return jsonify({"error": "Failed to save uploaded file"}), 500
+    
+    file_path = file_info['file_path']
+    print(f"File saved successfully to: {file_path}")
+    print(f"File exists after save: {os.path.exists(file_path)}")
 
     try:
-        os.makedirs(temp_dir, exist_ok=True)
-        file.save(file_path)
         print(f"File saved successfully to: {file_path}")
 
         # Load trained models
@@ -1324,6 +1671,25 @@ def predict():
         # Process resume
         preview_url = generate_pdf_preview(file_path)
         resume_text, sections = process_uploaded_resume(file_path)
+        
+        # Extract candidate name using Gemini
+        prompt = """You are given a resume in plain text. Your task is to extract the candidate's full name. 
+        The name is usually found at the top or in the "CONTACT" or "PROFILE" section. Return only the name.
+        
+        Resume text:
+        {text}
+        
+        Return ONLY the full name, nothing else. If you can't find a name, return 'Candidate'."""
+        
+        formatted_prompt = prompt.format(text=resume_text[:1000])
+        name_response = gemini_text_model.generate_content(formatted_prompt)
+        candidate_name = name_response.text.strip()
+        
+        # Basic validation of extracted name
+        if not (len(candidate_name.split()) >= 1 and len(candidate_name.split()) <= 4):
+            candidate_name = "Candidate"
+        
+        print(f"Extracted candidate name: {candidate_name}")
         
         # Make prediction
         job_role, confidence, explanation, model_used = predict_job_role(
@@ -1339,28 +1705,48 @@ def predict():
             "alternative_roles": explanation.get("alternative_roles", [])
         }
         
+        # Prepare file info for response
+        file_info_for_response = {
+            "path": file_path,  # Use the direct file path
+            "original_name": file_info['original_filename'],
+            "unique_name": file_info['unique_filename']
+        }
+        print("File info being sent in response:", file_info_for_response)
+        
         response = {
             "success": True,
             "predictions": [{
                 "label": job_role,
                 "confidence": confidence,
                 "explanation": final_explanation,
-                "model": f"{model_used} with Gemini AI Enhancement"
+                "model": f"{model_used} with Gemini AI Enhancement",
+                "candidate_name": candidate_name,
+                "file_info": file_info_for_response
             }]
         }
         if preview_url:
             response["preview_url"] = preview_url
+            
+        # Verify file still exists before sending response
+        if os.path.exists(file_path):
+            print(f"File still exists at path: {file_path}")
+        else:
+            print(f"Warning: File no longer exists at path: {file_path}")
+            
         return jsonify(response)
     except Exception as e:
         print(f"Prediction failed: {str(e)}\n{traceback.format_exc()}")
         return jsonify({"error": f"Prediction failed: {str(e)}"}), 500
-    finally:
+    except Exception as e:
+        print(f"Prediction failed: {str(e)}\n{traceback.format_exc()}")
+        # Only clean up file on error
         if os.path.exists(file_path):
-            print(f"Cleaning up file: {file_path}")
+            print(f"Cleaning up file due to error: {file_path}")
             try:
                 os.remove(file_path)
-            except Exception as e:
-                print(f"Error cleaning up file {file_path}: {e}")
+            except Exception as cleanup_error:
+                print(f"Error cleaning up file {file_path}: {cleanup_error}")
+        return jsonify({"error": f"Prediction failed: {str(e)}"}), 500
                 
 def extract_key_skills(text, tfidf_vectorizer):
     """
@@ -1392,6 +1778,283 @@ def extract_key_skills(text, tfidf_vectorizer):
 
     # Return a reasonable number of top terms (e.g., top 10 or 15)
     return scored_terms[:15]
+
+@app.route('/feedback', methods=['POST'])
+def submit_feedback():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        result = data.get('result')
+        feedback = data.get('feedback')
+        
+        if not result or not feedback:
+            return jsonify({"error": "Missing required fields"}), 400
+            
+        # Validate the feedback type
+        valid_feedback_types = [
+            "Positive feedback",
+            "The result is bias and not accurate",
+            "The role doesn't fit with the resume",
+            "The output is hard to understand"
+        ]
+        
+        if feedback not in valid_feedback_types:
+            return jsonify({"error": "Invalid feedback type"}), 400
+        
+        try:
+            # Insert feedback into Supabase
+            response = supabase.table('feedback').insert({
+                'result': result,
+                'feedback': feedback
+            }).execute()
+            
+            if not response.data:
+                raise Exception("No data returned from Supabase")
+                
+            return jsonify({
+                "success": True,
+                "message": "Feedback submitted successfully",
+                "data": response.data
+            })
+            
+        except Exception as supabase_error:
+            print(f"Supabase error: {str(supabase_error)}")
+            return jsonify({
+                "error": "Database error",
+                "details": str(supabase_error)
+            }), 500
+            
+    except Exception as e:
+        print(f"Error submitting feedback: {str(e)}")
+        return jsonify({
+            "error": "Server error",
+            "details": str(e)
+        }), 500
+
+def extract_candidate_name(resume_text):
+    """Extract candidate name using Gemini AI."""
+    try:
+        prompt = """You are given a resume in plain text. Your task is to extract the candidate's full name. 
+        The name is usually found at the top or in the "CONTACT" or "PROFILE" section. Return only the name.
+        
+        Resume text:
+        {text}
+        
+        Return ONLY the full name, nothing else. If you can't find a name, return 'Candidate'."""
+        
+        # Format the prompt with the resume text
+        formatted_prompt = prompt.format(text=resume_text[:1000])  # Use first 1000 chars for efficiency
+        
+        # Get response from Gemini
+        response = gemini_text_model.generate_content(formatted_prompt)
+        
+        # Clean and validate the response
+        extracted_name = response.text.strip()
+        
+        # Basic validation
+        if len(extracted_name.split()) >= 1 and len(extracted_name.split()) <= 4:
+            return extracted_name
+        
+        return "Candidate"
+        
+    except Exception as e:
+        print(f"Error extracting name with Gemini: {str(e)}")
+        return "Candidate"
+
+def generate_pdf_content(prediction_data):
+    """Generate HTML content for the PDF."""
+    
+    # Format confidence as percentage
+    confidence = f"{prediction_data['confidence'] * 100:.1f}%"
+    
+    # Get the explanation text and candidate name
+    explanation = prediction_data.get('explanation', {}).get('text', '')
+    candidate_name = prediction_data.get('candidate_name', 'Candidate')
+    
+    # Handle the original resume content
+    original_resume = prediction_data.get('original_resume')
+    file_type = prediction_data.get('file_type', '')
+    
+    # Create resume display HTML based on file type
+    resume_display = ""
+    if original_resume:
+        if file_type == '.pdf':
+            resume_display = f'<embed src="data:application/pdf;base64,{original_resume}" type="application/pdf" width="100%" height="600px" />'
+        elif file_type in ['.jpg', '.jpeg', '.png']:
+            resume_display = f'<img src="data:image/{file_type[1:]};base64,{original_resume}" style="max-width: 100%; height: auto;" />'
+    
+    # Split explanation into sections
+    sections = explanation.split('\n\n')
+    formatted_sections = []
+    
+    for section in sections:
+        if ':' in section:
+            title, content = section.split(':', 1)
+            formatted_sections.append(f"""
+                <div class="section">
+                    <h3>{title.strip()}</h3>
+                    <p>{content.strip()}</p>
+                </div>
+            """)
+    
+    # Generate HTML content
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                line-height: 1.6;
+                color: #333;
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 20px;
+            }}
+            .header {{
+                text-align: center;
+                margin-bottom: 30px;
+                padding-bottom: 20px;
+                border-bottom: 2px solid #eee;
+            }}
+            .prediction-summary {{
+                background: #f8f9fa;
+                padding: 20px;
+                border-radius: 8px;
+                margin-bottom: 30px;
+            }}
+            .confidence {{
+                color: #28a745;
+                font-weight: bold;
+            }}
+            .section {{
+                margin-bottom: 20px;
+            }}
+            h1 {{
+                color: #2c3e50;
+                margin-bottom: 10px;
+            }}
+            h2 {{
+                color: #2c3e50;
+                margin-bottom: 10px;
+            }}
+            h3 {{
+                color: #2c3e50;
+                border-bottom: 1px solid #eee;
+                padding-bottom: 5px;
+                margin-bottom: 10px;
+            }}
+            .footer {{
+                margin-top: 40px;
+                text-align: center;
+                font-size: 0.9em;
+                color: #666;
+            }}
+            .candidate-name {{
+                font-size: 1.5em;
+                color: #2c3e50;
+                margin-bottom: 15px;
+                font-weight: bold;
+            }}
+            .resume-section {{
+                background: #fff;
+                padding: 20px;
+                border: 1px solid #eee;
+                border-radius: 8px;
+                margin: 20px 0;
+                white-space: pre-wrap;
+                font-family: monospace;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>AI Job Role Prediction Report</h1>
+            <p>Generated on {datetime.now().strftime('%B %d, %Y %H:%M')}</p>
+        </div>
+        
+        <div class="prediction-summary">
+            <div class="candidate-name">{candidate_name}</div>
+            <h2>Predicted Role: {prediction_data['label']}</h2>
+            <p>Match Percentage: <span class="confidence">{confidence}</span></p>
+            <p>Model: {prediction_data['model']}</p>
+        </div>
+        
+        <div class="analysis">
+            {''.join(formatted_sections)}
+        </div>
+        
+        <div class="footer">
+            <p>Generated by AI Job Role Prediction Platform</p>
+            <p>© {datetime.now().year} All Rights Reserved</p>
+        </div>
+    </body>
+    </html>
+    """
+    return html_content
+
+@app.route('/download-pdf', methods=['POST'])
+def download_pdf():
+    try:
+        data = request.json
+        print("Received data in download_pdf:", data)
+        if not data:
+            return jsonify({"error": "No prediction data provided"}), 400
+
+        # Generate HTML content
+        html_content = generate_pdf_content(data)
+        
+        # Create a temporary file for the HTML
+        temp_html = tempfile.NamedTemporaryFile(suffix='.html', delete=False)
+        temp_html.write(html_content.encode('utf-8'))
+        temp_html.close()
+        
+        # Create a temporary file for the PDF report
+        temp_pdf = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+        temp_pdf.close()
+
+        try:
+            # Convert HTML to PDF
+            options = {
+                'page-size': 'A4',
+                'margin-top': '0.75in',
+                'margin-right': '0.75in',
+                'margin-bottom': '0.75in',
+                'margin-left': '0.75in',
+                'encoding': 'UTF-8',
+                'no-outline': None
+            }
+            
+            print("Converting HTML to PDF...")
+            pdfkit.from_file(temp_html.name, temp_pdf.name, options=options)
+            print("PDF conversion complete")
+            
+            # Read the PDF file
+            with open(temp_pdf.name, 'rb') as f:
+                pdf_content = f.read()
+            
+            # Create response
+            response = make_response(pdf_content)
+            response.headers['Content-Type'] = 'application/pdf'
+            response.headers['Content-Disposition'] = 'attachment; filename=job_prediction_report.pdf'
+            
+            return response
+            
+        finally:
+            # Clean up temporary files
+            os.unlink(temp_html.name)
+            os.unlink(temp_pdf.name)
+            
+    except Exception as e:
+        print(f"Error generating PDF: {str(e)}")
+        print("Full error details:", traceback.format_exc())
+        return jsonify({
+            "error": "Failed to generate PDF",
+            "details": str(e)
+        }), 500
 
 # Run Flask with ngrok
 NGROK_AUTH_TOKEN = "2zBA5iHkCv7ApqDStrt9SqwSu1u_4NwhjBSY8J812iwmUP3V4"
