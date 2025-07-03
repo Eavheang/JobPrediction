@@ -25,10 +25,47 @@ import shutil
 import time
 from flask import Flask, request, jsonify, make_response, send_file
 from werkzeug.utils import secure_filename
+import requests
 
 # Create temporary directory for file storage
 UPLOAD_FOLDER = os.path.join(tempfile.gettempdir(), 'resume_uploads')
+MODELS_FOLDER = os.path.join(tempfile.gettempdir(), 'models')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(MODELS_FOLDER, exist_ok=True)
+
+def download_models_from_storage():
+    """Download model files from Supabase storage if they don't exist locally"""
+    try:
+        model_files = ['lstm_epoch_150.pt', 'distilbert_epoch_150.pt']
+        
+        for model_file in model_files:
+            local_path = os.path.join(MODELS_FOLDER, model_file)
+            
+            # Skip if model already exists
+            if os.path.exists(local_path):
+                print(f"Model {model_file} already exists locally")
+                continue
+            
+            print(f"Downloading {model_file} from storage...")
+            
+            # Get the download URL from Supabase storage
+            response = supabase.storage.from_('models').get_public_url(model_file)
+            
+            if response:
+                # Download the file
+                model_response = requests.get(response)
+                if model_response.status_code == 200:
+                    with open(local_path, 'wb') as f:
+                        f.write(model_response.content)
+                    print(f"Successfully downloaded {model_file}")
+                else:
+                    print(f"Failed to download {model_file}: {model_response.status_code}")
+            else:
+                print(f"Failed to get URL for {model_file}")
+                
+    except Exception as e:
+        print(f"Error downloading models: {e}")
+        raise
 
 def cleanup_old_files():
     """Remove files older than 1 hour from the upload folder"""
@@ -606,7 +643,15 @@ def generate_pdf_preview(file_path):
         print(f"Error generating PDF preview: {e}")
         return None
 
-def load_trained_models(lstm_path='checkpoints/lstm_epoch_150.pt', distilbert_path='checkpoints/distilbert_epoch_150.pt'):
+def load_trained_models(lstm_path=None, distilbert_path=None):
+    """Load the trained models from the specified paths or default locations"""
+    if lstm_path is None:
+        lstm_path = os.path.join(MODELS_FOLDER, 'lstm_epoch_150.pt')
+    if distilbert_path is None:
+        distilbert_path = os.path.join(MODELS_FOLDER, 'distilbert_epoch_150.pt')
+    
+    # Ensure models are downloaded
+    download_models_from_storage()
     
     # Load LSTM model
     lstm_model = LSTMClassifier(input_dim=5000, hidden_dim=128, output_dim=num_classes)
@@ -830,7 +875,7 @@ Alternative Careers:
 [ Write a brief analysis of the alternative careers suggested by Gemini AI, including their match percentages and reasoning the total percentage including the current role shouldn't exceed 100% and make them in to one section and remove any symbols in the section such as *]
 The Alternative Careers section should include the following roles:
 Role 1 (Role name)
-Match: prediction%
+Match: prediction% 
 Reasoning: Why the candidate is a good fit for this role based on their skills and experience.
 and so on as long as you think the candidate is a good fit for the role.
 
@@ -1863,8 +1908,20 @@ def extract_candidate_name(resume_text):
         print(f"Error extracting name with Gemini: {str(e)}")
         return "Candidate"
 
+import re
+from datetime import datetime
+
+import re
+from datetime import datetime
+
+import re
+from datetime import datetime
+
+import re
+from datetime import datetime
+
 def generate_pdf_content(prediction_data):
-    """Generate HTML content for the PDF."""
+    """Generate enhanced HTML content for the PDF with improved formatting."""
     
     # Format confidence as percentage
     confidence = f"{prediction_data['confidence'] * 100:.1f}%"
@@ -1876,6 +1933,14 @@ def generate_pdf_content(prediction_data):
     # Handle the original resume content
     original_resume = prediction_data.get('original_resume')
     file_type = prediction_data.get('file_type', '')
+    
+    # Read and encode the logo image
+    try:
+        with open('public/jobPrediction.jpg', 'rb') as img_file:
+            logo_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+    except Exception as e:
+        print(f"Error reading logo: {e}")
+        logo_base64 = None
     
     # Create resume display HTML based on file type
     resume_display = ""
@@ -1892,104 +1957,395 @@ def generate_pdf_content(prediction_data):
     for section in sections:
         if ':' in section:
             title, content = section.split(':', 1)
-            formatted_sections.append(f"""
-                <div class="section">
-                    <h3>{title.strip()}</h3>
-                    <p>{content.strip()}</p>
-                </div>
-            """)
+            title = title.strip()
+            content = content.strip()
+            
+            # Special handling for Questions for Candidate section
+            if "Questions for Candidate" in title:
+                # Split by numbered items and clean up
+                questions = []
+                lines = content.split('\n')
+                current_question = ""
+                
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # Check if this line starts with a number (new question)
+                    if re.match(r'^\d+\.', line):
+                        # Save previous question if exists
+                        if current_question:
+                            questions.append(current_question.strip())
+                        # Start new question
+                        current_question = re.sub(r'^\d+\.\s*', '', line)
+                    else:
+                        # Continue current question
+                        current_question += " " + line
+                
+                # Don't forget the last question
+                if current_question:
+                    questions.append(current_question.strip())
+                
+                formatted_content = '<ol class="questions-list">'
+                for question in questions:
+                    if question.strip():
+                        formatted_content += f'<li class="question-item">{question.strip()}</li>'
+                formatted_content += '</ol>'
+                
+                formatted_sections.append(f"""
+                    <div class="section questions-section">
+                        <h3 class="section-title">{title}</h3>
+                        {formatted_content}
+                    </div>
+                """)
+            
+            # Handle other sections with enhanced formatting (including Alternative Careers)
+            else:
+                # Format the content with bold keywords
+                formatted_content = content
+                
+                # Make common keywords bold
+                keywords = ['Skills:', 'Experience:', 'Education:', 'Strengths:', 'Weaknesses:', 
+                           'Recommendations:', 'Summary:', 'Analysis:', 'Key Points:']
+                
+                for keyword in keywords:
+                    formatted_content = formatted_content.replace(keyword, f'<strong>{keyword}</strong>')
+                
+                # Add line break before "Match" pattern and ensure proper formatting
+                formatted_content = re.sub(r'([^\n]*?)(\s*Match\s*\d+%)', r'\1<br/>\2', formatted_content)
+                
+                # Convert line breaks to paragraphs
+                paragraphs = [p.strip() for p in formatted_content.split('\n') if p.strip()]
+                formatted_content = ''.join([f'<p>{p}</p>' for p in paragraphs])
+                
+                formatted_sections.append(f"""
+                    <div class="section">
+                        <h3 class="section-title">{title}</h3>
+                        <div class="section-content">
+                            {formatted_content}
+                        </div>
+                    </div>
+                """)
     
-    # Generate HTML content
+    # Generate enhanced HTML content
     html_content = f"""
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="UTF-8">
         <style>
+            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+            
+            * {{
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }}
+            
             body {{
-                font-family: Arial, sans-serif;
+                font-family: 'Inter', Arial, sans-serif;
                 line-height: 1.6;
-                color: #333;
-                max-width: 800px;
+                color: #2c3e50;
+                max-width: 900px;
                 margin: 0 auto;
-                padding: 20px;
+                padding: 30px;
+                background: #f8fafc;
             }}
+            
+            .container {{
+                background: white;
+                border-radius: 12px;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+                overflow: hidden;
+            }}
+            
             .header {{
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: black;
                 text-align: center;
-                margin-bottom: 30px;
-                padding-bottom: 20px;
-                border-bottom: 2px solid #eee;
+                padding: 40px 30px;
+                position: relative;
             }}
-            .prediction-summary {{
-                background: #f8f9fa;
-                padding: 20px;
-                border-radius: 8px;
-                margin-bottom: 30px;
+            
+            .header::before {{
+                content: '';
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><defs><pattern id="grain" width="100" height="100" patternUnits="userSpaceOnUse"><circle cx="50" cy="50" r="1" fill="white" opacity="0.1"/></pattern></defs><rect width="100" height="100" fill="url(%23grain)"/></svg>');
+                opacity: 0.3;
             }}
-            .confidence {{
-                color: #28a745;
-                font-weight: bold;
+            
+            .header h1 {{
+                font-size: 2.2rem;
+                font-weight: 700;
+                margin-bottom: 10px;
+                position: relative;
+                z-index: 1;
+                color: black;
             }}
-            .section {{
+            
+            .header .subtitle {{
+                font-size: 1rem;
+                opacity: 0.9;
+                position: relative;
+                z-index: 1;
+                color: black;
+            }}
+            
+            .logo {{
+                text-align: center;
                 margin-bottom: 20px;
             }}
-            h1 {{
-                color: #2c3e50;
-                margin-bottom: 10px;
+            
+            .logo img {{
+                max-width: 200px;
+                height: auto;
+                border-radius: 10px;
+                box-shadow: 0 4px 8px rgba(0,0,0,0.1);
             }}
-            h2 {{
-                color: #2c3e50;
-                margin-bottom: 10px;
+            
+            .content {{
+                padding: 40px;
             }}
-            h3 {{
-                color: #2c3e50;
-                border-bottom: 1px solid #eee;
-                padding-bottom: 5px;
-                margin-bottom: 10px;
-            }}
-            .footer {{
-                margin-top: 40px;
+            
+            .prediction-summary {{
+                background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+                color: black;
+                padding: 30px;
+                border-radius: 12px;
+                margin-bottom: 40px;
                 text-align: center;
-                font-size: 0.9em;
-                color: #666;
+                position: relative;
+                overflow: hidden;
             }}
+            
+            .prediction-summary::before {{
+                content: '';
+                position: absolute;
+                top: -50%;
+                left: -50%;
+                width: 200%;
+                height: 200%;
+                background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
+                animation: shimmer 3s infinite;
+            }}
+            
+            @keyframes shimmer {{
+                0% {{ transform: rotate(0deg); }}
+                100% {{ transform: rotate(360deg); }}
+            }}
+            
             .candidate-name {{
-                font-size: 1.5em;
-                color: #2c3e50;
+                font-size: 1.7rem;
+                font-weight: 600;
                 margin-bottom: 15px;
-                font-weight: bold;
+                position: relative;
+                z-index: 1;
+                color: black;
             }}
-            .resume-section {{
-                background: #fff;
-                padding: 20px;
-                border: 1px solid #eee;
-                border-radius: 8px;
-                margin: 20px 0;
-                white-space: pre-wrap;
-                font-family: monospace;
+            
+            .predicted-role {{
+                font-size: 1.3rem;
+                font-weight: 500;
+                margin-bottom: 10px;
+                position: relative;
+                z-index: 1;
+                color: black;
+            }}
+            
+            .confidence {{
+                font-size: 1.5rem;
+                font-weight: 700;
+                text-shadow: 0 2px 4px rgba(0,0,0,0.2);
+                position: relative;
+                z-index: 1;
+                display: inline-block;
+                color: black;
+            }}
+            
+            .section {{
+                margin-bottom: 35px;
+                background: white;
+                border-radius: 10px;
+                padding: 25px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+                border-left: 4px solid #667eea;
+            }}
+            
+            .section-title {{
+                color: #2c3e50;
+                font-size: 1.1rem;
+                font-weight: 600;
+                margin-bottom: 20px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }}
+            
+            .section-content p {{
+                margin-bottom: 15px;
+                line-height: 1.7;
+                color: #4a5568;
+                font-size: 0.9rem;
+            }}
+            
+            .questions-section {{
+                border-left-color: #10b981;
+            }}
+            
+            .questions-list {{
+                list-style: none;
+                counter-reset: question-counter;
+            }}
+            
+            .question-item {{
+                counter-increment: question-counter;
+            }}
+
+            .question-item::before {{
+                content: counter(question-counter) ". ";
+            }}
+            
+            strong {{
+                color: #1f2937;
+                font-weight: 600;
+            }}
+            
+            .footer {{
+                margin-top: 50px;
+                text-align: center;
+                padding: 30px;
+                background: #f8fafc;
+                border-radius: 10px;
+                color: #6b7280;
+                font-size: 0.9rem;
+            }}
+            
+            .footer p {{
+                margin-bottom: 5px;
+            }}
+            
+            .notes-page {{
+                page-break-before: always;
+                min-height: 100vh;
+                background: white;
+                padding: 60px 40px;
+                box-sizing: border-box;
+            }}
+        
+            .notes-header {{
+                text-align: center;
+                margin-bottom: 40px;
+                border-bottom: 2px solid #667eea;
+                padding-bottom: 20px;
+            }}
+        
+            .notes-title {{
+                font-size: 32px;
+                font-weight: bold;
+                color: #2c3e50;
+                margin-bottom: 10px;
+            }}
+        
+            .notes-subtitle {{
+                font-size: 16px;
+                color: #666;
+                font-style: italic;
+            }}
+        
+            .notes-lines {{
+                margin-top: 40px;
+            }}
+        
+            .notes-line {{
+                border-bottom: 1px solid #ddd;
+                height: 40px;
+                margin-bottom: 20px;
+                position: relative;
+            }}
+        
+            .notes-line:nth-child(5n) {{
+                border-bottom: 1px solid #bbb;
+            }}
+        
+            .notes-line::before {{
+                content: '';
+                position: absolute;
+                left: 0;
+                top: 50%;
+                width: 4px;
+                height: 4px;
+                background: #ddd;
+                border-radius: 50%;
+                transform: translateY(-50%);
+            }}
+            
+            @media print {{
+                body {{
+                    background: white;
+                    padding: 0;
+                }}
+                
+                .section {{
+                    box-shadow: none;
+                    border: 1px solid #e5e7eb;
+                }}
+                .logo img {{
+                    filter: none;
+                    opacity: 0.8;
+                }}
             }}
         </style>
     </head>
     <body>
         <div class="header">
+            <div class="logo">
+                {f'<img src="data:image/jpeg;base64,{logo_base64}" alt="Job Prediction Logo">' if logo_base64 else ''}
+            </div>
             <h1>AI Job Role Prediction Report</h1>
-            <p>Generated on {datetime.now().strftime('%B %d, %Y %H:%M')}</p>
+            <p class="subtitle">Generated on {datetime.now().strftime('%B %d, %Y at %H:%M')}</p>
         </div>
         
-        <div class="prediction-summary">
-            <div class="candidate-name">{candidate_name}</div>
-            <h2>Predicted Role: {prediction_data['label']}</h2>
-            <p>Match Percentage: <span class="confidence">{confidence}</span></p>
-            <p>Model: {prediction_data['model']}</p>
-        </div>
-        
-        <div class="analysis">
-            {''.join(formatted_sections)}
+        <div class="content">
+            <div class="prediction-summary">
+                <div class="candidate-name">{candidate_name}</div>
+                <div class="predicted-role">{prediction_data['label']}</div>
+                <div class="confidence">{confidence} Match</div>
+            </div>
+            
+            <div class="analysis">
+                {''.join(formatted_sections)}
+            </div>
         </div>
         
         <div class="footer">
-            <p>Generated by AI Job Role Prediction Platform</p>
-            <p>© {datetime.now().year} All Rights Reserved</p>
+            <p><strong>Generated by AI Job Role Prediction Platform</strong></p>
+            <p>© {datetime.now().year} All Rights Reserved | Powered by Advanced AI Analytics</p>
+        </div>
+        
+        <div class="notes-page">
+            <div class="notes-header">
+                <h2 class="notes-title">Notes</h2>
+                <p class="notes-subtitle">Use this space to write additional comments, observations, or action items</p>
+            </div>
+            <div class="notes-lines">
+                <div class="notes-line"></div>
+                <div class="notes-line"></div>
+                <div class="notes-line"></div>
+                <div class="notes-line"></div>
+                <div class="notes-line"></div>
+                <div class="notes-line"></div>
+                <div class="notes-line"></div>
+                <div class="notes-line"></div>
+                <div class="notes-line"></div>
+                <div class="notes-line"></div>
+                <div class="notes-line"></div>
+                <div class="notes-line"></div>
+            </div>
         </div>
     </body>
     </html>
@@ -2057,7 +2413,7 @@ def download_pdf():
         }), 500
 
 # Run Flask with ngrok
-NGROK_AUTH_TOKEN = "2zBA5iHkCv7ApqDStrt9SqwSu1u_4NwhjBSY8J812iwmUP3V4"
+NGROK_AUTH_TOKEN = "2xLFc5ieceyok92mHQZirUoKprd_6vrFBv2wLxBZh87JkRRa3"
 try:
     ngrok.set_auth_token(NGROK_AUTH_TOKEN)
     ngrok.kill()
