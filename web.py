@@ -33,40 +33,6 @@ MODELS_FOLDER = os.path.join(tempfile.gettempdir(), 'models')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(MODELS_FOLDER, exist_ok=True)
 
-def download_models_from_storage():
-    """Download model files from Supabase storage if they don't exist locally"""
-    try:
-        model_files = ['lstm_epoch_150.pt', 'distilbert_epoch_150.pt']
-        
-        for model_file in model_files:
-            local_path = os.path.join(MODELS_FOLDER, model_file)
-            
-            # Skip if model already exists
-            if os.path.exists(local_path):
-                print(f"Model {model_file} already exists locally")
-                continue
-            
-            print(f"Downloading {model_file} from storage...")
-            
-            # Get the download URL from Supabase storage
-            response = supabase.storage.from_('models').get_public_url(model_file)
-            
-            if response:
-                # Download the file
-                model_response = requests.get(response)
-                if model_response.status_code == 200:
-                    with open(local_path, 'wb') as f:
-                        f.write(model_response.content)
-                    print(f"Successfully downloaded {model_file}")
-                else:
-                    print(f"Failed to download {model_file}: {model_response.status_code}")
-            else:
-                print(f"Failed to get URL for {model_file}")
-                
-    except Exception as e:
-        print(f"Error downloading models: {e}")
-        raise
-
 def cleanup_old_files():
     """Remove files older than 1 hour from the upload folder"""
     try:
@@ -643,15 +609,7 @@ def generate_pdf_preview(file_path):
         print(f"Error generating PDF preview: {e}")
         return None
 
-def load_trained_models(lstm_path=None, distilbert_path=None):
-    """Load the trained models from the specified paths or default locations"""
-    if lstm_path is None:
-        lstm_path = os.path.join(MODELS_FOLDER, 'lstm_epoch_150.pt')
-    if distilbert_path is None:
-        distilbert_path = os.path.join(MODELS_FOLDER, 'distilbert_epoch_150.pt')
-    
-    # Ensure models are downloaded
-    download_models_from_storage()
+def load_trained_models(lstm_path='checkpoints/lstm_epoch_150.pt', distilbert_path='checkpoints/distilbert_epoch_150.pt'):
     
     # Load LSTM model
     lstm_model = LSTMClassifier(input_dim=5000, hidden_dim=128, output_dim=num_classes)
